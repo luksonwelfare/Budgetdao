@@ -15,6 +15,11 @@
 (define-constant ERR_INVALID_MILESTONE_COUNT (err u113))
 (define-constant ERR_MILESTONE_VERIFICATION_REQUIRED (err u114))
 (define-constant ERR_INSUFFICIENT_MILESTONE_VOTES (err u115))
+(define-constant ERR_SELF_DELEGATION (err u116))
+(define-constant ERR_DELEGATION_NOT_FOUND (err u117))
+(define-constant ERR_DELEGATE_NOT_MEMBER (err u118))
+(define-constant ERR_CIRCULAR_DELEGATION (err u119))
+(define-constant ERR_DELEGATION_CHAIN_TOO_LONG (err u120))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var milestone-allocation-counter uint u0)
@@ -78,6 +83,33 @@
 (define-map milestone-verifications
   { allocation-id: uint, milestone-index: uint, verifier: principal }
   { verified: bool, verification-block: uint }
+)
+
+;; Delegation system maps
+(define-map delegations
+  principal
+  { 
+    delegate: principal, 
+    delegated-at: uint, 
+    active: bool 
+  }
+)
+
+(define-map delegation-powers
+  principal
+  {
+    delegator-count: uint,
+    last-updated: uint
+  }
+)
+
+(define-map delegation-override-votes
+  { proposal-id: uint, delegator: principal }
+  { 
+    vote: bool, 
+    voted-at: uint,
+    overridden: bool 
+  }
 )
 
 (define-public (initialize-budget (amount uint))
@@ -467,3 +499,234 @@
     false
   )
 )
+
+;; Delegation system functions
+
+(define-public (delegate-voting-power (delegate principal))
+  (let
+    (
+      (existing-delegation (map-get? delegations tx-sender))
+      (delegate-power (default-to { delegator-count: u0, last-updated: u0 } (map-get? delegation-powers delegate)))
+    )
+    ;; Validate delegation request
+    (asserts! (is-member tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (is-member delegate) ERR_DELEGATE_NOT_MEMBER)
+    (asserts! (not (is-eq tx-sender delegate)) ERR_SELF_DELEGATION)
+    (asserts! (not (would-create-circular-delegation delegate tx-sender)) ERR_CIRCULAR_DELEGATION)
+    
+    ;; Remove existing delegation if present
+    (match existing-delegation
+      current-delegation 
+      (if (get active current-delegation)
+        (begin
+          (update-delegate-power (get delegate current-delegation) false)
+          true
+        )
+        true
+      )
+      true
+    )
+    
+    ;; Create new delegation
+    (map-set delegations tx-sender
+      {
+        delegate: delegate,
+        delegated-at: stacks-block-height,
+        active: true
+      }
+    )
+    
+    ;; Update delegate's power count
+    (update-delegate-power delegate true)
+    (ok true)
+  )
+)
+
+(define-public (revoke-delegation)
+  (let
+    (
+      (delegation (unwrap! (map-get? delegations tx-sender) ERR_DELEGATION_NOT_FOUND))
+    )
+    (asserts! (get active delegation) ERR_DELEGATION_NOT_FOUND)
+    
+    ;; Deactivate delegation
+    (map-set delegations tx-sender
+      (merge delegation { active: false })
+    )
+    
+    ;; Update delegate's power count
+    (update-delegate-power (get delegate delegation) false)
+    (ok true)
+  )
+)
+
+(define-public (vote-with-delegation (proposal-id uint) (vote-for bool))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+      (delegate-power (default-to { delegator-count: u0, last-updated: u0 } (map-get? delegation-powers tx-sender)))
+      (existing-vote (map-get? votes { proposal-id: proposal-id, voter: tx-sender }))
+      (voting-power (+ u1 (get delegator-count delegate-power)))
+    )
+    ;; Validate voting conditions
+    (asserts! (is-member tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (<= stacks-block-height (get end-block proposal)) ERR_PROPOSAL_EXPIRED)
+    (asserts! (is-none existing-vote) ERR_ALREADY_VOTED)
+    
+    ;; Record the vote
+    (map-set votes 
+      { proposal-id: proposal-id, voter: tx-sender }
+      { vote: vote-for, stacks-block-height: stacks-block-height }
+    )
+    
+    ;; Update proposal vote counts with delegated power
+    (if vote-for
+      (map-set proposals proposal-id
+        (merge proposal { votes-for: (+ (get votes-for proposal) voting-power) })
+      )
+      (map-set proposals proposal-id
+        (merge proposal { votes-against: (+ (get votes-against proposal) voting-power) })
+      )
+    )
+    (ok voting-power)
+  )
+)
+
+(define-public (override-delegated-vote (proposal-id uint) (vote-for bool))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+      (delegation (unwrap! (map-get? delegations tx-sender) ERR_DELEGATION_NOT_FOUND))
+      (existing-override (map-get? delegation-override-votes { proposal-id: proposal-id, delegator: tx-sender }))
+      (delegate-vote (map-get? votes { proposal-id: proposal-id, voter: (get delegate delegation) }))
+    )
+    ;; Validate override conditions
+    (asserts! (is-member tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (get active delegation) ERR_DELEGATION_NOT_FOUND)
+    (asserts! (<= stacks-block-height (get end-block proposal)) ERR_PROPOSAL_EXPIRED)
+    (asserts! (is-none existing-override) ERR_ALREADY_VOTED)
+    (asserts! (is-some delegate-vote) ERR_PROPOSAL_NOT_FOUND)
+    
+    ;; Record override vote
+    (map-set delegation-override-votes
+      { proposal-id: proposal-id, delegator: tx-sender }
+      {
+        vote: vote-for,
+        voted-at: stacks-block-height,
+        overridden: true
+      }
+    )
+    
+    ;; Adjust vote counts: remove delegate's vote for this delegator, add override
+    (let
+      (
+        (delegate-voted-for (get vote (unwrap-panic delegate-vote)))
+        (updated-proposal (unwrap! (map-get? proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+      )
+      ;; Remove one vote from delegate's choice
+      (if delegate-voted-for
+        (map-set proposals proposal-id
+          (merge updated-proposal { votes-for: (- (get votes-for updated-proposal) u1) })
+        )
+        (map-set proposals proposal-id
+          (merge updated-proposal { votes-against: (- (get votes-against updated-proposal) u1) })
+        )
+      )
+      
+      ;; Add override vote
+      (let ((final-proposal (unwrap! (map-get? proposals proposal-id) ERR_PROPOSAL_NOT_FOUND)))
+        (if vote-for
+          (map-set proposals proposal-id
+            (merge final-proposal { votes-for: (+ (get votes-for final-proposal) u1) })
+          )
+          (map-set proposals proposal-id
+            (merge final-proposal { votes-against: (+ (get votes-against final-proposal) u1) })
+          )
+        )
+      )
+    )
+    (ok true)
+  )
+)
+
+;; Helper functions for delegation system
+
+(define-private (update-delegate-power (delegate principal) (increase bool))
+  (let
+    (
+      (current-power (default-to { delegator-count: u0, last-updated: u0 } (map-get? delegation-powers delegate)))
+      (new-count (if increase 
+                    (+ (get delegator-count current-power) u1)
+                    (- (get delegator-count current-power) u1)))
+    )
+    (map-set delegation-powers delegate
+      {
+        delegator-count: new-count,
+        last-updated: stacks-block-height
+      }
+    )
+    true
+  )
+)
+
+(define-private (would-create-circular-delegation (potential-delegate principal) (original-delegator principal))
+  ;; Simple check: if the potential delegate is already delegating to the original delegator
+  (match (map-get? delegations potential-delegate)
+    delegation 
+    (and 
+      (get active delegation)
+      (is-eq (get delegate delegation) original-delegator)
+    )
+    false
+  )
+)
+
+;; Read-only functions for delegation system
+
+(define-read-only (get-delegation (delegator principal))
+  (map-get? delegations delegator)
+)
+
+(define-read-only (get-delegation-power (delegate principal))
+  (map-get? delegation-powers delegate)
+)
+
+(define-read-only (get-effective-voting-power (member principal))
+  (let
+    (
+      (delegation-power (default-to { delegator-count: u0, last-updated: u0 } (map-get? delegation-powers member)))
+    )
+    (if (is-member member)
+      (+ u1 (get delegator-count delegation-power))
+      u0
+    )
+  )
+)
+
+(define-read-only (get-override-vote (proposal-id uint) (delegator principal))
+  (map-get? delegation-override-votes { proposal-id: proposal-id, delegator: delegator })
+)
+
+(define-read-only (is-delegating (member principal))
+  (match (map-get? delegations member)
+    delegation (get active delegation)
+    false
+  )
+)
+
+(define-read-only (get-delegation-chain (member principal))
+  (let
+    (
+      (delegation (map-get? delegations member))
+    )
+    (match delegation
+      del 
+      (if (get active del)
+        (some (get delegate del))
+        none
+      )
+      none
+    )
+  )
+)
+
